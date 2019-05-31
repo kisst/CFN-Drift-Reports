@@ -1,0 +1,396 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  This stack will create a Lambda Function which then monitor all other CFN
+  stack in the given account.
+Metadata:
+  Author: Nordcloud (Tamas Kiss)
+  Project: CFN Drift Monitoring
+
+Parameters:
+  CronLine1:
+    Description: To define the times when the Drift detection is running
+    Type: String
+    Default: "0 6,19 * * ? *"
+  CronLine2:
+    Description: To define the times when the Drift Search is running
+    Type: String
+    Default: "10 6,19 * * ? *"
+  EmailAddress:
+    Description: |
+      The e-mail adress where drift notification should be sent, leave empty to disable
+    Type: String
+    Default: ""
+
+Conditions:
+  SendEmail:
+    !Not [!Equals [!Ref EmailAddress, ""]]
+
+Resources:
+  CFNLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AllowLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+        - PolicyName: AllowCFN
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:*'  # TODO no fine grade IAM permission for drift yet
+                Resource: '*'
+        - PolicyName: AllowSNS
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:ListSubscriptions
+                  - sns:ListSubscriptionsByTopic
+                  - sns:ListTopics
+                  - sns:Publish
+                Resource: !Ref NotificationSNSTopic
+
+  LambdaLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AllowLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+        - PolicyName: AllowLambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:AddLayerVersionPermission
+                  - lambda:GetLayerVersion
+                  - lambda:GetLayerVersionPolicy
+                  - lambda:ListLayerVersions
+                  - lambda:PublishLayerVersion
+                Resource: '*'
+
+  LambdaLayerBuilderFuntion:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: 'Build a lambda layer with the latest version of boto3'
+      Code:
+        ZipFile: |
+          """
+          Lambda function to create a Lambda layer from CFN
+          """
+          from __future__ import print_function
+          import subprocess
+          import sys
+          import os
+          import zipfile
+          import json
+          import importlib
+          try:
+              import cfnresponse
+              CFN_CALL = True
+          except ImportError:
+              CFN_CALL = False
+
+          PKG_DIR = "/tmp/packages/python/lib/python3.7/site-packages"
+          PKG_ROOT = "/tmp/packages"
+
+
+          def lambda_handler(event, context):
+              """
+              Main function to be called by Lambda
+              """
+              request_type = event['RequestType']
+              packages = event['ResourceProperties']['requirements']
+              name = event['ResourceProperties']['Name']
+              region = event['ResourceProperties']['Region']
+
+              if request_type == 'Create' or request_type == 'Update':
+                  pass
+              else:
+                  print("Nothing to do here")
+                  # Tell CFN that do are done doing nothing
+                  if CFN_CALL:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, '')
+                  # Exit at this point
+                  sys.exit
+
+              install_with_pip(packages)
+              zipit(PKG_ROOT, "/tmp/layer")
+              layer_arn = publish_layer(name, region)
+
+              if CFN_CALL:
+                  data = { "Arn": layer_arn}
+                  physical_id = layer_arn
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, data, physical_id)
+
+
+          def zipit(src, dst):
+              """
+              Create a zip file from src into dst.zip
+              """
+              zipf = zipfile.ZipFile("%s.zip" % (dst), "w", zipfile.ZIP_DEFLATED)
+              abs_src = os.path.abspath(src)
+              for dirname, _, files in os.walk(src):
+                  for filename in files:
+                      absname = os.path.abspath(os.path.join(dirname, filename))
+                      arcname = absname[len(abs_src) + 1:]
+                      zipf.write(absname, arcname)
+              zipf.close()
+
+
+          def install_with_pip(packages):
+              """
+              Install pip package into /tmp folder
+              """
+              print(" -- Installing pip packages")
+              logfile = open("/tmp/pip-install.log", "wb")
+              for package in packages:
+                  print(" ---- Installing {}".format(package))
+                  subprocess.check_call([
+                      sys.executable, '-m', 'pip', 'install',
+                      '--upgrade', '--no-deps', '-t', PKG_DIR, package], stdout=logfile)
+
+
+          def publish_layer(name, region):
+              """
+              Publish the built zip as a Lambda layer
+              """
+              logfile = open("/tmp/pip-install.log", "wb")
+              subprocess.check_call([
+                      sys.executable, '-m', 'pip', 'install',
+                      '--upgrade', '-t', '/tmp/upload', 'boto3'], stdout=logfile)
+
+              # my pip location
+              sys.path.insert(0, '/tmp/upload')
+              import botocore
+              importlib.reload(botocore)
+              import boto3
+
+
+              client = boto3.client('lambda', region_name=region)
+              response = client.publish_layer_version(
+                  LayerName=name,
+                  Description='Build with CFN Custom Resource',
+                  Content={'ZipFile': file_get_content('/tmp/layer.zip')},
+                  CompatibleRuntimes=['python3.7'])
+              return response['LayerVersionArn']
+
+
+          def file_get_content(filename):
+              """
+              Read the ZIP into python parsable var
+              """
+              with open(filename, 'rb') as filevar:
+                  return filevar.read()
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Timeout: 300
+      Role: !GetAtt LambdaLambdaExecutionRole.Arn
+
+
+  TriggerDriftDetectFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: 'Reqest drift detection to run against all CFN template'
+      Code:
+        ZipFile: |
+          """
+          CFN Drift tool, detect, scan, then alarm
+          """
+
+          from __future__ import print_function
+          import boto3
+          from botocore.exceptions import ClientError
+
+          REGIONS = boto3.session.Session().get_available_regions('cloudformation')
+
+
+          def lambda_handler(event, context):
+              """
+              This function routes to different parts of the script
+              """
+              if event['EventType'] == 'detect':
+                  detect()
+              elif event['EventType'] == 'find':
+                  find(event)
+
+
+          def detect():
+              """
+              This function reqest AWS to run the drift detection
+              in all stack in all region
+              """
+              for region in REGIONS:
+                  sts = boto3.client('sts', region_name=region)
+                  try:
+                      me = sts.get_caller_identity()
+                      print("Checking {} region".format(region))
+                      cfn = boto3.client('cloudformation', region_name=region)
+                      cfn_list = cfn.describe_stacks()
+                      for stack in cfn_list['Stacks']:
+                          print(" -- Found stack: {}".format(stack['StackName']))
+                          call = cfn.detect_stack_drift(StackName=stack['StackName'])
+                          print(call)
+                  except ClientError as exc:
+                      if exc.response['Error']['Code'] == 'InvalidClientTokenId':
+                          print("This IAM role is not autharized to use {} region.".format(region))
+                      else:
+                          print("Unexpected error: {}".format(exc))
+ 
+
+          def find(event):
+              """
+              After the detect run on all, this function check the statuses
+              """
+              drifted = []
+              sns = boto3.client('sns')
+
+              for region in REGIONS:
+                  sts = boto3.client('sts', region_name=region)
+                  try:
+                      me = sts.get_caller_identity()
+                      print("Searching for stacks in {} region".format(region))
+                      cfn = boto3.client('cloudformation', region_name=region)
+                      cfn_list = cfn.describe_stacks()
+                      for stack in cfn_list['Stacks']:
+                          print("  Found stack: {}".format(stack['StackName']))
+                          response = cfn.describe_stack_resource_drifts(
+                              StackName=stack['StackName']
+                          )
+                          for resource in response['StackResourceDrifts']:
+                              if resource['StackResourceDriftStatus'] != "IN_SYNC":
+                                  drifted.append(resource)
+                  except ClientError as exc:
+                      if exc.response['Error']['Code'] == 'InvalidClientTokenId':
+                          print("This IAM role is not autharized to use {} region.".format(region))
+                      else:
+                          print("Unexpected error: {}".format(exc))
+
+              message = ""
+              for resource in drifted:
+                  message += str("*{}* status found on *{}* stack in the *{}* resource\n".format(
+                      resource['StackResourceDriftStatus'],
+                      resource['StackId'],
+                      resource['LogicalResourceId']))
+                  message += str("this is a *{}* type resource, with the ID *{}*\n\n".format(
+                      resource['ResourceType'],
+                      resource['PhysicalResourceId']))
+              response = sns.publish(
+                  TopicArn=event['TopicArn'],
+                  Message=message,
+                  Subject='Drift Detected')
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Timeout: 180
+      Role: !GetAtt CFNLambdaExecutionRole.Arn
+      Layers:
+        - !GetAtt Boto3LambdaLayer.Arn
+
+  Boto3LambdaLayer:
+    Properties:
+      ServiceToken: !GetAtt LambdaLayerBuilderFuntion.Arn
+      Name: boto3-latest
+      Region: !Ref "AWS::Region"
+      requirements:
+        - boto3
+        - botocore
+    Type: Custom::LayerBuilder
+
+  DetectSchedule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: 'This is the CFN Drift monitoring tool [Detect]'
+      ScheduleExpression: !Sub "cron(${CronLine1})"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TriggerDriftDetectFunction.Arn
+          Id: TriggerDriftDetectFunctionV1
+          Input: !Sub |
+           {"EventType": "detect", "TopicArn": "${NotificationSNSTopic}" }
+
+  FindSchedule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: 'This is the CFN Drift monitoring tool [Find]'
+      ScheduleExpression: !Sub "cron(${CronLine2})"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TriggerDriftDetectFunction.Arn
+          Id: TriggerDriftDetectFunctionV2
+          Input: !Sub |
+           {"EventType": "find", "TopicArn": "${NotificationSNSTopic}" }
+
+  DectectEventLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref TriggerDriftDetectFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DetectSchedule.Arn
+
+  FindEventLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref TriggerDriftDetectFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FindSchedule.Arn
+
+  NotificationSNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: CFN-DRIFT
+
+  EmailNotification:
+    Condition: SendEmail
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      Endpoint: !Ref EmailAddress
+      Protocol: email
+      TopicArn: !Ref NotificationSNSTopic
+
+Outputs:
+  NotificationSNSTopic:
+    Description: SNS topic where Drift notifucations are sent
+    Value: !Ref NotificationSNSTopic
